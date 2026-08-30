@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SimulAlert — Cold Calling Dashboard</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; color: #1a1a1a; margin: 0; background: #F5F6F8; }
+  #app { max-width: 1180px; margin: 0 auto; padding: 20px; }
+  .sa-btn { background: #C0392B; color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .sa-btn:hover { background: #a5321f; }
+  .sa-btn-secondary { background: #fff; color: #1B2A4A; border: 1px solid #1B2A4A; border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .sa-btn-secondary:hover { background: #EAF0F8; }
+  .sa-card { background: #fff; border: 1px solid #E4E6EB; border-radius: 12px; padding: 16px; }
+  .sa-select, .sa-input { padding: 8px 10px; border: 1px solid #D6DAE1; border-radius: 6px; font-size: 13px; font-family: inherit; background: #fff; }
+  .sa-tab { padding: 10px 16px; font-size: 14px; font-weight: 600; color: #7a7a7a; cursor: pointer; border: none; background: none; border-bottom: 3px solid transparent; }
+  .sa-tab.active { color: #1B2A4A; border-bottom: 3px solid #C0392B; }
+  table.sa-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.sa-table th { text-align: left; background: #1B2A4A; color: #fff; padding: 8px 10px; position: sticky; top: 0; }
+  table.sa-table td { padding: 7px 10px; border-bottom: 1px solid #EEE; vertical-align: top; }
+  table.sa-table tr:nth-child(even) td { background: #FAFBFD; }
+  .sa-badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 10.5px; font-weight: 700; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+(function () {
+  // ---- CONFIGURE HERE: which sheet / tab this dashboard reads from ----
+  const SHEET_ID = "1xGQhHEdQRTVBRhm7hFRIeTsQYHVMksZeS3jdohSWrVE";
+  const GID = "1653662173"; // Pennsylvania Private tab
+  const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&gid=${GID}`;
+  const AUTO_REFRESH_SECONDS = 120;
+  const REPS = ["Taimoor", "Grace", "Daniel Cooper"];
+
+  // Disposition keyword classifier — checked in priority order, first match wins
+  const CLASSIFY_RULES = [
+    { label: "Demo Booked", color: "#1BAF7A", funnelRank: 3, test: n => /\bdemo\b/i.test(n) },
+    { label: "Not Interested", color: "#E24B4A", funnelRank: 0, test: n => /not interested/i.test(n) },
+    { label: "Interested", color: "#3FB27F", funnelRank: 2, test: n => /interested/i.test(n) },
+    { label: "Already Have System / Competitor", color: "#EDA100", funnelRank: 1, test: n => /already have|already in contract|competitor/i.test(n) },
+    { label: "No Longer a School", color: "#888780", funnelRank: -1, test: n => /no longer a school|closed/i.test(n) },
+    { label: "Wrong Number", color: "#888780", funnelRank: -1, test: n => /wrong number/i.test(n) },
+    { label: "Voicemail", color: "#378ADD", funnelRank: 0, test: n => /voicemail|voice mail|recording|transferred to voicemail/i.test(n) },
+    { label: "No Answer / Hang Up", color: "#7F77DD", funnelRank: 0, test: n => /no answer|no one picked|hang ?up|disconnected|didn.t pick/i.test(n) },
+    { label: "Contact Info Obtained", color: "#2E8ADB", funnelRank: 1, test: n => /@/.test(n) || /principal|director|manager|facilities/i.test(n) },
+    { label: "Call Back / Follow Up", color: "#D4537E", funnelRank: 1, test: n => /call back|call the main office|follow up/i.test(n) },
+  ];
+  const FALLBACK_LABEL = "Uncategorized";
+  const FALLBACK_RANK = 0;
+  // funnelRank: -1 = dead/excluded, 0 = attempted only, 1 = connected, 2 = interested, 3 = demo booked
+  const FUNNEL_STAGES = [
+    { key: 0, label: "Attempted" },
+    { key: 1, label: "Connected" },
+    { key: 2, label: "Interested" },
+    { key: 3, label: "Demo Booked" }
+  ];
+
+  const app = document.getElementById("app");
+  let rows = [];
+  let loadState = "loading"; // loading | ok | error
+  let errorMsg = "";
+  let activeTab = "dashboard";
+  let filterRegion = "";
+  let filterDisp = "";
+  let filterRep = "";
+  let dispChart = null;
+  let regionChart = null;
+  let funnelChart = null;
+  let refreshTimer = null;
+  let lastLoaded = null;
+
+  function rankFor(label) {
+    if (label === FALLBACK_LABEL) return FALLBACK_RANK;
+    const r = CLASSIFY_RULES.find(r => r.label === label);
+    return r ? r.funnelRank : FALLBACK_RANK;
+  }
+  function repRows() {
+    return filterRep ? rows.filter(r => (r.rep || "").trim() === filterRep) : rows;
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  }
+
+  // Minimal RFC4180 CSV parser (handles quoted fields, embedded commas/newlines/quotes)
+  function parseCSV(text) {
+    const rows = [];
+    let row = [], field = "", inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i], next = text[i + 1];
+      if (inQuotes) {
+        if (c === '"' && next === '"') { field += '"'; i++; }
+        else if (c === '"') { inQuotes = false; }
+        else { field += c; }
+      } else {
+        if (c === '"') inQuotes = true;
+        else if (c === ',') { row.push(field); field = ""; }
+        else if (c === '\r') { /* skip */ }
+        else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ""; }
+        else field += c;
+      }
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows.filter(r => r.some(f => f.trim() !== ""));
+  }
+
+  function classify(notes) {
+    const n = (notes || "").trim();
+    if (!n) return FALLBACK_LABEL;
+    for (const rule of CLASSIFY_RULES) { if (rule.test(n)) return rule.label; }
+    return FALLBACK_LABEL;
+  }
+
+  function colorFor(label) {
+    const r = CLASSIFY_RULES.find(r => r.label === label);
+    return r ? r.color : "#B4B2A9";
+  }
+
+  function parseDate(d) {
+    // sheet dates look like "10-08-2026" (DD-MM-YYYY based on observed data)
+    if (!d) return null;
+    const m = String(d).trim().match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+    if (!m) return null;
+    const [, dd, mm, yyyy] = m;
+    return new Date(`${yyyy}-${mm.padStart(2,"0")}-${dd.padStart(2,"0")}T00:00:00`);
+  }
+
+  async function loadData() {
+    loadState = "loading"; render();
+    try {
+      const res = await fetch(CSV_URL, { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const text = await res.text();
+      const table = parseCSV(text);
+      if (!table.length) throw new Error("Sheet returned no rows");
+      const header = table[0].map(h => h.trim().toLowerCase());
+      const idx = {
+        school: header.findIndex(h => h.includes("school")),
+        phone: header.findIndex(h => h.includes("phone")),
+        website: header.findIndex(h => h.includes("website") || h.includes("profile")),
+        city: header.findIndex(h => h === "city"),
+        region: header.findIndex(h => h.includes("region")),
+        notes: header.findIndex(h => h.includes("note")),
+        date: header.findIndex(h => h.includes("date")),
+        rep: header.findIndex(h => h.includes("rep")),
+      };
+      rows = table.slice(1).map(r => {
+        const notes = idx.notes >= 0 ? r[idx.notes] : "";
+        return {
+          school: idx.school >= 0 ? r[idx.school] : "",
+          phone: idx.phone >= 0 ? r[idx.phone] : "",
+          city: idx.city >= 0 ? r[idx.city] : "",
+          region: idx.region >= 0 ? r[idx.region] : "",
+          notes: notes,
+          dateRaw: idx.date >= 0 ? r[idx.date] : "",
+          date: parseDate(idx.date >= 0 ? r[idx.date] : ""),
+          rep: idx.rep >= 0 ? r[idx.rep] : "",
+          disposition: classify(notes)
+        };
+      }).filter(r => r.school && r.school.trim());
+      loadState = "ok";
+      lastLoaded = new Date();
+    } catch (e) {
+      loadState = "error";
+      errorMsg = e.message || String(e);
+    }
+    render();
+  }
+
+  function computeStats() {
+    const rs = repRows();
+    const total = rs.length;
+    const dispCounts = {};
+    rs.forEach(r => { dispCounts[r.disposition] = (dispCounts[r.disposition] || 0) + 1; });
+    const regionCounts = {};
+    rs.forEach(r => { const reg = r.region || "Unspecified"; regionCounts[reg] = (regionCounts[reg] || 0) + 1; });
+    const repCounts = {};
+    rs.forEach(r => { const rp = (r.rep || "").trim() || "Unassigned"; repCounts[rp] = (repCounts[rp] || 0) + 1; });
+    const withDate = rs.filter(r => r.date);
+    const sevenDaysAgo = new Date(); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const last7 = withDate.filter(r => r.date >= sevenDaysAgo).length;
+    const contactInfo = dispCounts["Contact Info Obtained"] || 0;
+    const notInterestedLike = (dispCounts["Not Interested"] || 0) + (dispCounts["Already Have System / Competitor"] || 0);
+    const dead = (dispCounts["No Longer a School"] || 0) + (dispCounts["Wrong Number"] || 0);
+    const attempted = total - (dispCounts[FALLBACK_LABEL] || 0);
+    const noAnswerLike = (dispCounts["No Answer / Hang Up"] || 0) + (dispCounts["Voicemail"] || 0);
+    const connectRate = attempted ? Math.round(((attempted - noAnswerLike) / attempted) * 100) : 0;
+    // duplicate detection: same school + phone
+    const seen = new Set(); let dupes = 0;
+    rs.forEach(r => { const k = r.school.trim().toLowerCase() + "|" + r.phone.trim(); if (seen.has(k)) dupes++; else seen.add(k); });
+
+    // Funnel: rows with a rank >= that stage's key (excludes dead/-1 rows entirely)
+    const eligible = rs.filter(r => rankFor(r.disposition) >= 0);
+    const funnel = FUNNEL_STAGES.map(stage => ({
+      label: stage.label,
+      count: eligible.filter(r => rankFor(r.disposition) >= stage.key).length
+    }));
+
+    return { total, dispCounts, regionCounts, repCounts, last7, contactInfo, notInterestedLike, dead, connectRate, dupes, funnel };
+  }
+
+  function kpiCard(label, value) {
+    return `<div class="sa-card" style="text-align:center;">
+      <div style="font-size:11.5px;color:#7a7a7a;font-weight:600;text-transform:uppercase;letter-spacing:0.03em;margin-bottom:6px;">${escapeHtml(label)}</div>
+      <div style="font-size:24px;font-weight:700;color:#1B2A4A;">${escapeHtml(value)}</div>
+    </div>`;
+  }
+
+  function renderHeader() {
+    const statusDot = loadState === "ok" ? "#1BAF7A" : loadState === "error" ? "#E24B4A" : "#EDA100";
+    const statusText = loadState === "ok"
+      ? `Live · updated ${lastLoaded ? lastLoaded.toLocaleTimeString() : ""}`
+      : loadState === "error" ? "Couldn't load sheet" : "Loading...";
+    return `
+      <div style="display:flex; align-items:center; justify-content:space-between; padding-bottom:14px; border-bottom:1px solid #E4E6EB; margin-bottom:16px; flex-wrap:wrap; gap:10px;">
+        <div>
+          <div style="font-size:19px;font-weight:700;color:#1B2A4A;">SimulAlert <span style="font-weight:400;font-size:12px;color:#C0392B;font-style:italic;">Every Second in Mind</span></div>
+          <div style="font-size:11.5px;color:#999;margin-top:2px;">Pennsylvania Private — Cold Calling Dashboard (read-only, pulled from Google Sheets)</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <span style="display:flex; align-items:center; gap:6px; font-size:12px; color:#4a4a4a;">
+            <span style="width:8px; height:8px; border-radius:50%; background:${statusDot}; display:inline-block;"></span>${escapeHtml(statusText)}
+          </span>
+          <button id="refresh-btn" class="sa-btn-secondary">Refresh now</button>
+          <a href="https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit#gid=${GID}" target="_blank" class="sa-btn-secondary" style="text-decoration:none;">Open sheet</a>
+        </div>
+      </div>
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:14px;">
+        <div style="display:flex; gap:4px; border-bottom:1px solid #E4E6EB;">
+          <button class="sa-tab ${activeTab === "dashboard" ? "active" : ""}" data-tab="dashboard">Dashboard</button>
+          <button class="sa-tab ${activeTab === "pipeline" ? "active" : ""}" data-tab="pipeline">Pipeline</button>
+          <button class="sa-tab ${activeTab === "table" ? "active" : ""}" data-tab="table">All schools</button>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <label style="font-size:12px;font-weight:600;color:#4a4a4a;">Viewing as</label>
+          <select id="filter-rep-global" class="sa-select">
+            <option value="" ${filterRep===""?"selected":""}>All reps</option>
+            ${REPS.map(r => `<option value="${escapeHtml(r)}" ${filterRep===r?"selected":""}>${escapeHtml(r)}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderError() {
+    const isLocalFile = typeof location !== "undefined" && location.protocol === "file:";
+    const hint = isLocalFile
+      ? `This page is open as a local file (the address bar starts with <code>file://</code>). Browsers block local files
+         from fetching data off the web for security reasons — this dashboard has to be hosted on a real URL
+         (GitHub Pages, Netlify, etc.) to pull live data. This isn't fixable by changing sheet settings.`
+      : `Double-check the sheet's Share setting is "Anyone with the link — Viewer." If it already is, Google may be
+         rejecting the request from this domain — try reloading, and if it persists, the sheet or tab (gid) may have
+         changed.`;
+    return `
+      <div class="sa-card" style="text-align:center; padding:40px 20px;">
+        <div style="font-size:15px;font-weight:700;color:#C0392B;margin-bottom:8px;">Couldn't load the sheet</div>
+        <div style="font-size:13px;color:#555; max-width:520px; margin:0 auto 14px;">${escapeHtml(errorMsg)}</div>
+        <div style="font-size:12.5px;color:#888; max-width:520px; margin:0 auto 16px; line-height:1.6;">${hint}</div>
+        <button id="retry-btn" class="sa-btn">Try again</button>
+      </div>
+    `;
+  }
+
+  function renderDashboard() {
+    if (loadState === "loading") return `<div style="padding:60px; text-align:center; color:#999;">Loading live data from Google Sheets...</div>`;
+    if (loadState === "error") return renderError();
+    const s = computeStats();
+    return `
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:12px; margin-bottom:20px;">
+        ${kpiCard("Total schools", s.total)}
+        ${kpiCard("Logged last 7 days", s.last7)}
+        ${kpiCard("Connect rate*", s.connectRate + "%")}
+        ${kpiCard("Contact info obtained", s.contactInfo)}
+        ${kpiCard("Not interested / has system", s.notInterestedLike)}
+        ${kpiCard("Possible duplicates", s.dupes)}
+      </div>
+      <div style="font-size:11px; color:#999; margin:-10px 0 16px;">*Connect rate excludes uncategorized notes and treats No Answer / Voicemail as non-connects — see "About these numbers" below.</div>
+
+      <div class="sa-card" style="margin-bottom:20px;">
+        <div style="font-size:13px;font-weight:700;color:#1B2A4A;margin-bottom:4px;">${filterRep ? escapeHtml(filterRep) + "'s" : "Team"} funnel</div>
+        <div style="font-size:11px;color:#999;margin-bottom:10px;">Attempted → Connected → Interested → Demo Booked (dead/invalid rows excluded)</div>
+        <div style="display:flex; gap:8px; align-items:stretch; flex-wrap:wrap;">
+          ${s.funnel.map((stage, i) => {
+            const prev = i > 0 ? s.funnel[i-1].count : null;
+            const pct = prev ? (prev ? Math.round((stage.count / prev) * 100) : 0) : 100;
+            const widthPct = s.funnel[0].count ? Math.max(18, Math.round((stage.count / s.funnel[0].count) * 100)) : 18;
+            return `
+            <div style="flex:1; min-width:130px;">
+              <div style="background:linear-gradient(90deg, #1B2A4A, #2E4370); color:#fff; border-radius:8px 8px 0 0; padding:10px; text-align:center; width:${widthPct}%; min-width:100%;">
+                <div style="font-size:20px;font-weight:700;">${stage.count}</div>
+                <div style="font-size:10.5px; text-transform:uppercase; letter-spacing:0.03em; opacity:0.85;">${escapeHtml(stage.label)}</div>
+              </div>
+              ${i > 0 ? `<div style="text-align:center; font-size:11px; color:${pct < 30 ? '#C0392B' : '#1BAF7A'}; font-weight:700; margin-top:4px;">${pct}% of prior stage</div>` : `<div style="text-align:center; font-size:11px; color:#999; margin-top:4px;">baseline</div>`}
+            </div>`;
+          }).join("")}
+        </div>
+      </div>
+
+      <div style="display:grid; grid-template-columns: 1.3fr 1fr; gap:16px; margin-bottom:20px;">
+        <div class="sa-card">
+          <div style="font-size:13px;font-weight:700;color:#1B2A4A;margin-bottom:10px;">Notes classified by outcome</div>
+          <div style="position:relative; height:300px;"><canvas id="dispChart" role="img" aria-label="Bar chart of school counts by classified call outcome"></canvas></div>
+        </div>
+        <div class="sa-card">
+          <div style="font-size:13px;font-weight:700;color:#1B2A4A;margin-bottom:10px;">${filterRep ? "Region breakdown" : "Calls by rep"}</div>
+          <div style="position:relative; height:300px;"><canvas id="regionChart" role="img" aria-label="Bar chart"></canvas></div>
+        </div>
+      </div>
+      <div class="sa-card" style="font-size:12px; color:#777; line-height:1.6;">
+        <strong style="color:#1B2A4A;">About these numbers:</strong> this sheet doesn't have a structured disposition
+        column yet, so outcomes above are guessed from keywords in the Notes column (e.g. "not interested," "voicemail,"
+        "already have it"). Anything that doesn't match a known phrase lands in <em>Uncategorized</em> — treat that
+        bucket, and these percentages generally, as directional, not exact. Add a Rep and Disposition column to the
+        sheet going forward for numbers you can actually trust.
+      </div>
+    `;
+  }
+
+  function drawCharts() {
+    if (loadState !== "ok") return;
+    const s = computeStats();
+    const dispCtx = document.getElementById("dispChart");
+    const regionCtx = document.getElementById("regionChart");
+    if (!dispCtx || !regionCtx || typeof Chart === "undefined") return;
+    if (dispChart) dispChart.destroy();
+    if (regionChart) regionChart.destroy();
+
+    const dispLabels = Object.keys(s.dispCounts).sort((a,b) => s.dispCounts[b] - s.dispCounts[a]);
+    dispChart = new Chart(dispCtx, {
+      type: "bar",
+      data: { labels: dispLabels, datasets: [{ data: dispLabels.map(l => s.dispCounts[l]), backgroundColor: dispLabels.map(colorFor) }] },
+      options: { indexAxis: "y", responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }
+    });
+
+    const secondSource = filterRep ? s.regionCounts : s.repCounts;
+    const secondLabels = Object.keys(secondSource).sort((a,b) => secondSource[b]-secondSource[a]);
+    regionChart = new Chart(regionCtx, {
+      type: "bar",
+      data: { labels: secondLabels, datasets: [{ data: secondLabels.map(l => secondSource[l]), backgroundColor: "#1B2A4A" }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }
+    });
+  }
+
+  function renderPipeline() {
+    if (loadState === "loading") return `<div style="padding:60px; text-align:center; color:#999;">Loading...</div>`;
+    if (loadState === "error") return renderError();
+    const rs = repRows();
+    const buckets = [...CLASSIFY_RULES.map(r => r.label), FALLBACK_LABEL];
+    const columns = buckets.map(label => ({
+      label,
+      color: colorFor(label),
+      items: rs.filter(r => r.disposition === label)
+    })).filter(c => c.items.length > 0);
+    return `
+      <div style="font-size:12px;color:#999;margin-bottom:12px;">
+        ${filterRep ? escapeHtml(filterRep) + "'s" : "Team"} pipeline — every school grouped by its current classified outcome. Scroll a column to see more.
+      </div>
+      <div style="display:flex; gap:12px; overflow-x:auto; padding-bottom:8px;">
+        ${columns.map(col => `
+          <div style="min-width:220px; max-width:220px; flex-shrink:0;">
+            <div style="background:${col.color}; color:#fff; border-radius:8px 8px 0 0; padding:8px 10px; font-size:12px; font-weight:700; display:flex; justify-content:space-between;">
+              <span>${escapeHtml(col.label)}</span><span>${col.items.length}</span>
+            </div>
+            <div style="background:#fff; border:1px solid #E4E6EB; border-top:none; border-radius:0 0 8px 8px; max-height:480px; overflow-y:auto;">
+              ${col.items.slice(0, 30).map(item => `
+                <div style="padding:8px 10px; border-bottom:1px solid #F0F1F4; font-size:12px;">
+                  <div style="font-weight:600; color:#1B2A4A;">${escapeHtml(item.school)}</div>
+                  <div style="color:#999; font-size:11px;">${escapeHtml(item.city || "")}${item.rep ? " · " + escapeHtml(item.rep) : ""}${item.dateRaw ? " · " + escapeHtml(item.dateRaw) : ""}</div>
+                </div>
+              `).join("")}
+              ${col.items.length > 30 ? `<div style="padding:8px 10px; font-size:11px; color:#999; text-align:center;">+ ${col.items.length - 30} more — see "All schools" tab</div>` : ""}
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderTable() {
+    if (loadState === "loading") return `<div style="padding:60px; text-align:center; color:#999;">Loading...</div>`;
+    if (loadState === "error") return renderError();
+    const rs = repRows();
+    const regions = ["", ...Array.from(new Set(rs.map(r => r.region || "Unspecified")))];
+    const disps = ["", ...CLASSIFY_RULES.map(r => r.label), FALLBACK_LABEL];
+    const filtered = rs.filter(r =>
+      (!filterRegion || (r.region || "Unspecified") === filterRegion) &&
+      (!filterDisp || r.disposition === filterDisp)
+    );
+    return `
+      <div class="sa-card">
+        <div style="display:flex; gap:12px; margin-bottom:14px; flex-wrap:wrap; align-items:flex-end;">
+          <div>
+            <label style="font-size:12px;font-weight:600;color:#4a4a4a;display:block;margin-bottom:4px;">Region</label>
+            <select id="filter-region" class="sa-select">${regions.map(r => `<option value="${escapeHtml(r)}" ${filterRegion===r?"selected":""}>${r||"All regions"}</option>`).join("")}</select>
+          </div>
+          <div>
+            <label style="font-size:12px;font-weight:600;color:#4a4a4a;display:block;margin-bottom:4px;">Outcome</label>
+            <select id="filter-disp" class="sa-select">${disps.map(d => `<option value="${escapeHtml(d)}" ${filterDisp===d?"selected":""}>${d||"All outcomes"}</option>`).join("")}</select>
+          </div>
+          <div style="margin-left:auto; font-size:12px; color:#999;">${filtered.length} of ${rs.length} schools</div>
+        </div>
+        <div style="max-height:520px; overflow-y:auto;">
+          <table class="sa-table">
+            <thead><tr><th>School</th><th>City</th><th>Region</th><th>Phone</th><th>Date</th><th>Rep</th><th>Outcome</th><th>Notes</th></tr></thead>
+            <tbody>
+              ${filtered.length === 0 ? `<tr><td colspan="8" style="text-align:center;color:#999;padding:20px;">No rows match this filter.</td></tr>` :
+                filtered.map(r => `<tr>
+                  <td>${escapeHtml(r.school)}</td>
+                  <td>${escapeHtml(r.city)}</td>
+                  <td>${escapeHtml(r.region)}</td>
+                  <td>${escapeHtml(r.phone)}</td>
+                  <td>${escapeHtml(r.dateRaw)}</td>
+                  <td>${escapeHtml(r.rep)}</td>
+                  <td><span class="sa-badge" style="background:${colorFor(r.disposition)}22; color:${colorFor(r.disposition)};">${escapeHtml(r.disposition)}</span></td>
+                  <td style="max-width:260px;">${escapeHtml(r.notes)}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
+  function render() {
+    let body;
+    if (activeTab === "dashboard") body = renderDashboard();
+    else if (activeTab === "pipeline") body = renderPipeline();
+    else body = renderTable();
+
+    app.innerHTML = renderHeader() + body;
+
+    document.getElementById("refresh-btn").addEventListener("click", loadData);
+    const retryBtn = document.getElementById("retry-btn");
+    if (retryBtn) retryBtn.addEventListener("click", loadData);
+    app.querySelectorAll(".sa-tab").forEach(btn => btn.addEventListener("click", () => { activeTab = btn.dataset.tab; render(); }));
+    const repSel = document.getElementById("filter-rep-global");
+    if (repSel) repSel.addEventListener("change", e => { filterRep = e.target.value; render(); });
+
+    if (activeTab === "dashboard" && loadState === "ok") setTimeout(drawCharts, 0);
+
+    if (activeTab === "table" && loadState === "ok") {
+      document.getElementById("filter-region").addEventListener("change", e => { filterRegion = e.target.value; render(); });
+      document.getElementById("filter-disp").addEventListener("change", e => { filterDisp = e.target.value; render(); });
+    }
+  }
+
+  loadData();
+  refreshTimer = setInterval(loadData, AUTO_REFRESH_SECONDS * 1000);
+})();
+</script>
+</body>
+</html>
